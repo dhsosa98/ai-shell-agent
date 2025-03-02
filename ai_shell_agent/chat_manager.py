@@ -3,8 +3,10 @@ import os
 import json
 from typing import Optional
 import uuid
+from colorama import Fore, Style
 
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
     HumanMessage, 
     AIMessage, 
@@ -16,13 +18,14 @@ from langchain_core.messages.utils import convert_to_openai_messages
 from .tools import tools_functions, direct_windows_shell_tool, tools
 from .prompts import default_system_prompt
 from . import logger
+from .llms import get_llm
+from .utils import Spinner
 
 CHAT_DIR = os.path.join("chats")
 CHAT_MAP_FILE = os.path.join(CHAT_DIR, "chat_map.json")
 SESSION_FILE = "session.json"
 CONFIG_FILE = "config.json"
-MODEL = "gpt-4o-mini"
-TEMPERATURE = 0
+
 
 # Ensure the chats directory exists.
 os.makedirs(CHAT_DIR, exist_ok=True)
@@ -119,7 +122,7 @@ def create_or_load_chat(title: str) -> str:
         _write_json(CHAT_MAP_FILE, chat_map)
     chat_file = os.path.join(CHAT_DIR, f"{chat_id}.json")
     if not os.path.exists(chat_file):
-        logger.info(f"Creating new chat session: {title}")
+        logger.info(f"{Fore.CYAN}Creating new chat session: {title}{Style.RESET_ALL}")
         # New chat: add default system prompt
         config = _read_json(CONFIG_FILE)
         logger.debug(f"Config: {config}")
@@ -137,7 +140,7 @@ def get_chat_titles_list() -> list:
     chat_map = _read_json(CHAT_MAP_FILE)
     chats = list(chat_map.keys())
     chats_str = "\n - ".join(chats)
-    logger.info(f"Chats: \n{chats_str}")
+    logger.info(f"{Fore.CYAN}Chats: \n - {Fore.MAGENTA}{chats_str}{Style.RESET_ALL}")
     return chats
 
 def rename_chat(old_title: str, new_title: str) -> bool:
@@ -156,9 +159,9 @@ def rename_chat(old_title: str, new_title: str) -> bool:
     if old_title in chat_map:
         chat_map[new_title] = chat_map.pop(old_title)
         _write_json(CHAT_MAP_FILE, chat_map)
-        logger.info(f"Chat session renamed: {old_title} -> {new_title}")
+        logger.info(f"{Fore.CYAN}Chat session renamed: {Fore.MAGENTA}{old_title} -> {new_title}{Style.RESET_ALL}")
         return True
-    logger.error(f"Chat session not found: {old_title}")
+    logger.error(f"{Fore.RED}Chat session not found: {old_title}{Style.RESET_ALL}")
     return False
 
 def delete_chat(title: str) -> bool:
@@ -179,9 +182,9 @@ def delete_chat(title: str) -> bool:
         chat_file = os.path.join(CHAT_DIR, f"{chat_id}.json")
         if os.path.exists(chat_file):
             os.remove(chat_file)
-            logger.info(f"Chat session deleted: {title}")
+            logger.info(f"{Fore.CYAN}Chat session deleted: {Fore.MAGENTA}{title}{Style.RESET_ALL}")
         return True
-    logger.error(f"Chat session not found: {title}")
+    logger.error(f"{Fore.RED}Chat session not found: {title}{Style.RESET_ALL}")
     return False
 
 def save_session(chat_file: str) -> None:
@@ -219,7 +222,7 @@ def _handle_tool_calls(ai_message: AIMessage) -> list[BaseMessage]:
         "interactive_windows_shell_tool": tools[0],
         "run_python_code": tools[1]
     }
-    logger.info(f"AI wants to run commands...")
+    logger.info(f"{Fore.YELLOW}AI wants to run commands...{Style.RESET_ALL}")
 
     for tool_call in ai_message.tool_calls:
         tool_name = None
@@ -227,7 +230,7 @@ def _handle_tool_calls(ai_message: AIMessage) -> list[BaseMessage]:
             tool_name = tool_call["name"]
             tool_call_id = tool_call["id"]
             if tool_name not in tools_dict:
-                logger.error(f"Unknown tool: {tool_name}")
+                logger.error(f"{Fore.RED}Unknown tool: {tool_name}{Style.RESET_ALL}")
                 continue
                 
             tool = tools_dict[tool_name]
@@ -236,7 +239,7 @@ def _handle_tool_calls(ai_message: AIMessage) -> list[BaseMessage]:
             messages.append(tool_response)
 
         except Exception as e:
-            logger.error(f"Error executing tool {tool_name}: {e}")
+            logger.error(f"{Fore.RED}Error executing tool {tool_name}: {e}{Style.RESET_ALL}")
             # Append an error message to the conversation
             error_message = AIMessage(content=f"Error executing tool {tool_name}: {e}")
             messages.append(error_message)
@@ -278,25 +281,32 @@ def send_message(message: str) -> str:
     logger.debug(f"Appended human message: {human_message}")
     # Log human message with correct index
     human_count = sum(1 for msg in current_messages if isinstance(msg, HumanMessage))
-    logger.info(f"id:{human_count-1}")
+    logger.info(f"{Fore.BLUE}User[{human_count-1}]: {message}{Style.RESET_ALL}")
     
     # Get AI response with complete history
-    llm = ChatOpenAI(model=MODEL, temperature=TEMPERATURE).bind_tools(tools_functions)
+    llm = get_llm().bind_tools(tools_functions)
 
     ai_response: AIMessage = None
     # Process response
-    while True:
-        logger.debug(f"Current messages: {current_messages}")
+    with Spinner("Thinking"):
+        # Initial AI response
         ai_response = llm.invoke(convert_to_openai_messages(current_messages))
         logger.debug(f"AI response: {ai_response}")
         current_messages.append(ai_response)
+    
+    # Handle tool calls outside the spinner
+    while ai_response.tool_calls and len(ai_response.tool_calls) > 0:
+        tool_messages = _handle_tool_calls(ai_response)
+        current_messages.extend(tool_messages)
         
-        if ai_response.tool_calls and len(ai_response.tool_calls) > 0:
-            tool_messages = _handle_tool_calls(ai_response)
-            current_messages.extend(tool_messages)
-        else:
-            logger.info(f"AI: {ai_response.content}")
-            break
+        # Get next response with spinner
+        with Spinner("Thinking"):
+            ai_response = llm.invoke(convert_to_openai_messages(current_messages))
+            logger.debug(f"AI follow-up response: {ai_response}")
+            current_messages.append(ai_response)
+    
+    # Display final AI response
+    logger.info(f"{Fore.GREEN}AI: {ai_response.content}{Style.RESET_ALL}")
     _write_messages(chat_file, current_messages)
     return ai_response.content
 
@@ -332,22 +342,30 @@ def start_temp_chat(message: str) -> str:
     human_index = human_message_count + 1
     
     current_messages.append(HumanMessage(content=message))
-    logger.debug(f"User[{human_index}]: {message}")
+    logger.debug(f"{Fore.BLUE}User[{human_index}]: {message}{Style.RESET_ALL}")
     
-    llm = ChatOpenAI(model=MODEL, temperature=0.7).bind_tools(tools_functions)
+    llm = get_llm().bind_tools(tools_functions)
     logger.debug(f"LLM: {llm}")
     
-    # Loop to process tool calls until no tool calls are returned
-    while True:
+    # Get initial AI response with spinner
+    with Spinner("Thinking"):
         ai_response: AIMessage = llm.invoke(convert_to_openai_messages(current_messages))
         logger.debug(f"AI response: {ai_response}")
         current_messages.append(ai_response)
-        if ai_response.tool_calls and len(ai_response.tool_calls) > 0:
-            tool_messages = _handle_tool_calls(ai_response)
-            current_messages.extend(tool_messages)
-        else:
-            logger.info(f"AI: {ai_response.content}")
-            break
+    
+    # Handle tool calls outside the spinner
+    while ai_response.tool_calls and len(ai_response.tool_calls) > 0:
+        tool_messages = _handle_tool_calls(ai_response)
+        current_messages.extend(tool_messages)
+        
+        # Get next response with spinner
+        with Spinner("Thinking"):
+            ai_response = llm.invoke(convert_to_openai_messages(current_messages))
+            logger.debug(f"AI follow-up response: {ai_response}")
+            current_messages.append(ai_response)
+    
+    # Display final AI response
+    logger.info(f"{Fore.GREEN}AI: {ai_response.content}{Style.RESET_ALL}")
     
     set_current_chat(chat_file)
     _write_messages(chat_file, current_messages)
@@ -404,6 +422,7 @@ def flush_temp_chats() -> None:
         chat_file = os.path.join(CHAT_DIR, f"{chat_id}.json")
         if os.path.exists(chat_file):
             os.remove(chat_file)
+            logger.debug(f"{Fore.CYAN}Removed temporary chat: {Fore.MAGENTA}{title}{Style.RESET_ALL}")
     logger.debug(f"Updated chat map: {chat_map}")
     _write_json(CHAT_MAP_FILE, chat_map)
 
@@ -421,7 +440,7 @@ def set_default_system_prompt(prompt_text: str) -> None:
     logger.debug(f"Config: {config}")
     config["default_system_prompt"] = prompt_text
     _write_json(CONFIG_FILE, config)
-    logger.info("Default system prompt saved to config.json")
+    logger.info(f"{Fore.CYAN}Default system prompt saved to config.json{Style.RESET_ALL}")
 
 def update_system_prompt(prompt_text: str) -> None:
     """
@@ -433,7 +452,7 @@ def update_system_prompt(prompt_text: str) -> None:
     chat_file = load_session()
     logger.debug(f"Chat file: {chat_file}")
     if not chat_file:
-        logger.warning("No active chat session to update.")
+        logger.warning(f"{Fore.YELLOW}No active chat session to update.{Style.RESET_ALL}")
         return
         
     messages = _read_messages(chat_file)
@@ -456,7 +475,7 @@ def execute(command: str) -> str:
     chat_file = get_current_chat()
     logger.debug(f"Chat file: {chat_file}")
     if not chat_file:
-        logger.info("No active chat session. Starting temporary chat...")
+        logger.info(f"{Fore.CYAN}No active chat session. Starting temporary chat...{Style.RESET_ALL}")
         console_session_id = _get_console_session_id()
         chat_file = create_or_load_chat(console_session_id)
     
@@ -496,7 +515,7 @@ def list_messages(chat_title:Optional[str]=None):
     if not chat_title:
         chat_file = get_current_chat()
         if not chat_file:
-            logger.error("No active chat session to list messages from.")
+            logger.error(f"{Fore.RED}No active chat session to list messages from.{Style.RESET_ALL}")
             return
         # Find corresponding title from chat_map
         chat_map = _read_json(CHAT_MAP_FILE)
@@ -509,7 +528,7 @@ def list_messages(chat_title:Optional[str]=None):
     logger.debug(f"Chat map: {chat_map}")
     chat_id = chat_map.get(chat_title, None)
     if not chat_id:
-        logger.error(f"Chat session not found: {chat_title}")
+        logger.error(f"{Fore.RED}Chat session not found: {chat_title}{Style.RESET_ALL}")
         return
     chat_file = os.path.join(CHAT_DIR, f"{chat_id}.json")
     current_messages = _read_messages(chat_file)
@@ -517,14 +536,14 @@ def list_messages(chat_title:Optional[str]=None):
     user_messages = 0
     for i, msg in enumerate(current_messages):
         if isinstance(msg, SystemMessage):
-            logger.debug(f"System: {msg.content}")
+            logger.debug(f"{Fore.MAGENTA}System: {msg.content}{Style.RESET_ALL}")
         elif isinstance(msg, HumanMessage):
-            logger.info(f"User[{user_messages}]: {msg.content}")
+            logger.info(f"{Fore.BLUE}User[{user_messages}]: {msg.content}{Style.RESET_ALL}")
             user_messages += 1
         elif isinstance(msg, AIMessage):
-            logger.info(f"AI: {msg.content}")
+            logger.info(f"{Fore.GREEN}AI: {msg.content}{Style.RESET_ALL}")
         elif isinstance(msg, ToolMessage):
-            logger.info(f"Tool: {msg.content}")
+            logger.info(f"{Fore.YELLOW}Tool: {msg.content}{Style.RESET_ALL}")
             
 def current_chat_title():
     """
@@ -532,10 +551,10 @@ def current_chat_title():
     """
     chat_file = get_current_chat()
     if not chat_file:
-        logger.info("No active chat session, you can use the -lsc flag to list all available chat sessions and -lc to load a chat session.")
+        logger.info(f"{Fore.YELLOW}No active chat session, you can use the {Fore.CYAN}-lsc{Fore.YELLOW} flag to list all available chat sessions and {Fore.CYAN}-lc{Fore.YELLOW} to load a chat session.{Style.RESET_ALL}")
         return
     chat_map = _read_json(CHAT_MAP_FILE)
     for title, chat_id in chat_map.items():
         if os.path.join(CHAT_DIR, f"{chat_id}.json") == chat_file:
-            logger.info(f"Current chat: {title}")
+            logger.info(f"{Fore.CYAN}Current chat: {Fore.MAGENTA}{title}{Style.RESET_ALL}")
             return
